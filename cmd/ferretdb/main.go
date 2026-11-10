@@ -58,8 +58,12 @@ import (
 //nolint:lll // for readability
 var cli struct {
 	// We hide `run` command to show only `ping` in the help message.
-	Run  struct{} `cmd:"" default:"1"                             hidden:""`
-	Ping struct{} `cmd:"" help:"Ping existing FerretDB instance."`
+	Run    struct{} `cmd:"" default:"1"                             hidden:""`
+	Ping   struct{} `cmd:"" help:"Ping existing FerretDB instance."`
+	Replay struct {
+		Path     string `arg:"" help:"Path to a bidirectional wire transcript file or directory." required:"" type:"path"`
+		SkipAuth bool   `help:"Skip non-replayable authentication frames and verify only the safe subsequence."`
+	} `cmd:"" help:"Replay a bidirectional wire transcript through the handler."`
 
 	Version bool `default:"false" help:"Print version to stdout and exit." env:"-"`
 
@@ -108,9 +112,11 @@ var cli struct {
 	Telemetry telemetry.Flag `default:"undecided" help:"${help_telemetry}" group:"Miscellaneous"`
 
 	Dev struct {
-		Version     bool   `hidden:""`
-		ReplSetName string `hidden:""`
-		RecordsDir  string `hidden:""`
+		Version            bool   `hidden:""`
+		ReplSetName        string `hidden:""`
+		RecordsDir         string `hidden:""`
+		TranscriptDir      string `hidden:""`
+		TranscriptMaxBytes int64  `hidden:""`
 
 		Telemetry struct {
 			URL            string        `default:"https://beacon.ferretdb.com/" hidden:""`
@@ -170,6 +176,9 @@ func main() {
 		if !ready.Probe(ctx) {
 			os.Exit(1)
 		}
+
+	case "replay":
+		runReplay()
 
 	default:
 		panic("unknown sub-command")
@@ -496,6 +505,9 @@ func run() {
 		TLSCAFile:      cli.Listen.TLSCaFile,
 		Mode:           middleware.Mode(cli.Mode),
 		TestRecordsDir: cli.Dev.RecordsDir,
+
+		TestTranscriptDir:      cli.Dev.TranscriptDir,
+		TestTranscriptMaxBytes: cli.Dev.TranscriptMaxBytes,
 
 		DataAPIAddr: cli.Listen.DataAPIAddr,
 

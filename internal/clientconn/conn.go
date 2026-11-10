@@ -37,6 +37,7 @@ import (
 	"github.com/FerretDB/FerretDB/v2/internal/clientconn/conninfo"
 	"github.com/FerretDB/FerretDB/v2/internal/handler/middleware"
 	"github.com/FerretDB/FerretDB/v2/internal/util/logging"
+	"github.com/FerretDB/FerretDB/v2/internal/wiretranscript"
 )
 
 // conn represents client connection.
@@ -45,6 +46,14 @@ type conn struct {
 	l              *slog.Logger
 	m              *middleware.Middleware
 	testRecordsDir string // if empty, no records are created
+
+	transcriptDir      string // if empty, no bidirectional transcript is created
+	transcriptMaxBytes int64
+	recorder           *wiretranscript.Recorder
+
+	// failure kinds used to derive the transcript end reason
+	writeFailed   bool
+	handlerFailed bool
 }
 
 // run runs the client connection until ctx is canceled, client disconnects,
@@ -58,9 +67,21 @@ func (c *conn) run(ctx context.Context) (err error) {
 	ctx, cancel := context.WithCancelCause(conninfo.Ctx(ctx, ci))
 
 	defer func() {
+		reason := wiretranscript.EndReasonUnspecified
+
 		if p := recover(); p != nil {
 			c.l.LogAttrs(ctx, logging.LevelDPanic, fmt.Sprint(p), logging.Error(err))
 			err = lazyerrors.New("panic")
+			reason = wiretranscript.EndReasonPanic
+		}
+
+		if c.recorder != nil {
+			if reason == wiretranscript.EndReasonUnspecified {
+				reason = c.endReason(ctx, err)
+			}
+
+			// Recorder failures never affect the connection; ignore the returned error.
+			_ = c.recorder.Close(reason)
 		}
 
 		cancel(lazyerrors.Errorf("run exits: %w", err))
@@ -71,6 +92,17 @@ func (c *conn) run(ctx context.Context) (err error) {
 		ci.Peer, err = netip.ParseAddrPort(c.netConn.RemoteAddr().String())
 		if err != nil {
 			err = lazyerrors.Error(err)
+			return
+		}
+	}
+
+	// The bidirectional transcript is explicitly enabled and independent from
+	// the legacy raw request byte recording below.
+	if c.transcriptDir != "" {
+		if c.recorder, err = wiretranscript.NewRecorder(c.transcriptDir, &wiretranscript.RecorderOpts{
+			MaxBytes: c.transcriptMaxBytes,
+			Logger:   c.l,
+		}); err != nil {
 			return
 		}
 	}
@@ -131,20 +163,50 @@ func (c *conn) processRequest(ctx context.Context, bufr *bufio.Reader, bufw *buf
 		return lazyerrors.Error(err)
 	}
 
+	// Recording is fail-safe: it never changes the request handling or the response.
+	if c.recorder != nil {
+		c.recorder.RecordRequest(reqHeader, reqBody)
+	}
+
 	resp := c.m.Handle(ctx, req)
 	if resp == nil {
+		c.handlerFailed = true
 		return lazyerrors.New("middleware returned nil response")
 	}
 
+	if c.recorder != nil {
+		c.recorder.RecordResponse(resp.WireHeader(), resp.WireBody())
+	}
+
 	if err = wire.WriteMessage(bufw, resp.WireHeader(), resp.WireBody()); err != nil {
+		c.writeFailed = true
 		return lazyerrors.Error(err)
 	}
 
 	if err = bufw.Flush(); err != nil {
+		c.writeFailed = true
 		return lazyerrors.Error(err)
 	}
 
 	return nil
+}
+
+// endReason maps the connection exit error to the transcript end reason.
+func (c *conn) endReason(ctx context.Context, err error) wiretranscript.EndReason {
+	switch {
+	case err == nil:
+		return wiretranscript.EndReasonUnspecified
+	case errors.Is(err, wire.ErrZeroRead):
+		return wiretranscript.EndReasonClientClosed
+	case c.handlerFailed:
+		return wiretranscript.EndReasonHandlerError
+	case c.writeFailed:
+		return wiretranscript.EndReasonWriteError
+	case ctx.Err() != nil:
+		return wiretranscript.EndReasonContextCanceled
+	default:
+		return wiretranscript.EndReasonReadError
+	}
 }
 
 // renamePartialFile takes over an open file `f` and closes it.

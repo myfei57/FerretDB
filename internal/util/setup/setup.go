@@ -62,7 +62,13 @@ type SetupOpts struct {
 	TLSKeyFile     string
 	TLSCAFile      string
 	Mode           middleware.Mode
-	TestRecordsDir string // empty value disables recording
+	TestRecordsDir string // empty value disables raw request recording
+
+	// TestTranscriptDir, when non-empty, explicitly enables the bidirectional wire transcript.
+	TestTranscriptDir string
+
+	// TestTranscriptMaxBytes is the per-connection transcript size budget.
+	TestTranscriptMaxBytes int64
 
 	// DataAPI listener
 	DataAPIAddr string // empty value disables Data API listener
@@ -181,6 +187,9 @@ func Setup(ctx context.Context, opts *SetupOpts) *SetupResult {
 		ProxyTLSCAFile:   opts.ProxyTLSCAFile,
 
 		TestRecordsDir: opts.TestRecordsDir,
+
+		TestTranscriptDir:      opts.TestTranscriptDir,
+		TestTranscriptMaxBytes: opts.TestTranscriptMaxBytes,
 	})
 	if err != nil {
 		opts.Logger.LogAttrs(ctx, logging.LevelDPanic, "Failed to construct wire protocol listener", logging.Error(err))

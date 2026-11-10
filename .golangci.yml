@@ -58,6 +58,7 @@ linters-settings:
           - "!**/internal/util/logging/*.go"
           - "!**/internal/util/scram/*.go"
           - "!**/internal/util/testutil/*.go"
+          - "!**/internal/wiretranscript/**.go"
         deny:
           - pkg: github.com/FerretDB/wire/wirebson
       documentdb:

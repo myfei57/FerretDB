@@ -70,7 +70,14 @@ type ListenerOpts struct {
 	ProxyTLSKeyFile  string
 	ProxyTLSCAFile   string
 
-	TestRecordsDir string // if empty, no records are created
+	TestRecordsDir string // if empty, no raw request records are created
+
+	// TestTranscriptDir, when non-empty, explicitly enables the bidirectional wire transcript.
+	TestTranscriptDir string
+
+	// TestTranscriptMaxBytes is the per-connection transcript size budget.
+	// Zero selects the package default.
+	TestTranscriptMaxBytes int64
 }
 
 // tlsConfig provides server TLS configuration for the given certificate and key files.
@@ -307,10 +314,12 @@ func acceptLoop(ctx context.Context, listener net.Listener, wg *sync.WaitGroup, 
 
 			//exhaustruct:enforce
 			conn := &conn{
-				netConn:        netConn,
-				l:              logging.WithName(l.ll, "// "+connID+" "),
-				m:              l.M,
-				testRecordsDir: l.TestRecordsDir,
+				netConn:            netConn,
+				l:                  logging.WithName(l.ll, "// "+connID+" "),
+				m:                  l.M,
+				testRecordsDir:     l.TestRecordsDir,
+				transcriptDir:      l.TestTranscriptDir,
+				transcriptMaxBytes: l.TestTranscriptMaxBytes,
 			}
 
 			l.ll.InfoContext(ctx, "Connection started", slog.String("conn", connID))
