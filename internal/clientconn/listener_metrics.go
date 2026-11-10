@@ -27,10 +27,27 @@ const (
 	subsystem = "client"
 )
 
+// TLS bundle reload metric label values. They contain neither file paths nor any PEM data.
+const (
+	tlsReloadResultSuccess = "success"
+	tlsReloadResultFailure = "failure"
+
+	tlsReloadReasonNone     = ""
+	tlsReloadReasonRead     = "read"
+	tlsReloadReasonValidate = "validate"
+	tlsReloadReasonDigest   = "digest"
+	tlsReloadReasonConfig   = "config"
+	tlsReloadReasonClosed   = "closed"
+	tlsReloadReasonDisabled = "disabled"
+)
+
 // listenerMetrics represents listener metrics.
 type listenerMetrics struct {
 	accepts   *prometheus.CounterVec
 	durations *prometheus.HistogramVec
+
+	tlsReloads          *prometheus.CounterVec
+	tlsBundleGeneration prometheus.Gauge
 }
 
 // NewListenerMetrics creates new listener metrics.
@@ -64,24 +81,64 @@ func NewListenerMetrics() *listenerMetrics {
 			},
 			[]string{"error"},
 		),
+		tlsReloads: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      "tls_bundle_reloads_total",
+				Help:      "Total number of inbound TLS bundle reload attempts, labeled by result and failure reason.",
+			},
+			[]string{"result", "reason"},
+		),
+		tlsBundleGeneration: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      "tls_bundle_generation",
+				Help: "Generation number of the inbound TLS bundle currently used by new handshakes;" +
+					" zero when TLS is disabled.",
+			},
+		),
 	}
 
 	lm.accepts.WithLabelValues("0")
 	lm.durations.WithLabelValues("0")
 
+	lm.tlsReloads.WithLabelValues(tlsReloadResultSuccess, tlsReloadReasonNone)
+
+	for _, reason := range []string{
+		tlsReloadReasonRead,
+		tlsReloadReasonValidate,
+		tlsReloadReasonDigest,
+		tlsReloadReasonConfig,
+		tlsReloadReasonClosed,
+		tlsReloadReasonDisabled,
+	} {
+		lm.tlsReloads.WithLabelValues(tlsReloadResultFailure, reason)
+	}
+
 	return lm
+}
+
+// recordTLSReload counts one TLS bundle reload attempt using fixed, non-sensitive labels.
+func (lm *listenerMetrics) recordTLSReload(result, reason string) {
+	lm.tlsReloads.WithLabelValues(result, reason).Inc()
 }
 
 // Describe implements [prometheus.Collector].
 func (lm *listenerMetrics) Describe(ch chan<- *prometheus.Desc) {
 	lm.accepts.Describe(ch)
 	lm.durations.Describe(ch)
+	lm.tlsReloads.Describe(ch)
+	lm.tlsBundleGeneration.Describe(ch)
 }
 
 // Collect implements [prometheus.Collector].
 func (lm *listenerMetrics) Collect(ch chan<- prometheus.Metric) {
 	lm.accepts.Collect(ch)
 	lm.durations.Collect(ch)
+	lm.tlsReloads.Collect(ch)
+	lm.tlsBundleGeneration.Collect(ch)
 }
 
 // check interfaces

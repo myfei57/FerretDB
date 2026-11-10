@@ -17,7 +17,6 @@ package clientconn
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,16 +38,17 @@ import (
 // Listener listens on one or multiple interfaces (TCP, Unix, TLS sockets)
 // and accepts incoming client connections.
 type Listener struct {
-	*ListenerOpts
-
-	ll *slog.Logger
-	lm *listenerMetrics
-
 	tcpListener  net.Listener
 	unixListener net.Listener
 	tlsListener  net.Listener
-
+	*ListenerOpts
+	ll              *slog.Logger
+	lm              *listenerMetrics
+	tlsBundle       *tlsBundle
 	listenersClosed chan struct{}
+	tlsClientAuth   tls.ClientAuthType
+	tlsMu           sync.RWMutex
+	closeOnce       sync.Once
 }
 
 // ListenerOpts represents listener configuration.
@@ -71,49 +71,6 @@ type ListenerOpts struct {
 	ProxyTLSCAFile   string
 
 	TestRecordsDir string // if empty, no records are created
-}
-
-// tlsConfig provides server TLS configuration for the given certificate and key files.
-// Passing caFile enables client certificate verification.
-func tlsConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
-	if _, err := os.Stat(certFile); err != nil {
-		return nil, fmt.Errorf("TLS certificate file: %w", err)
-	}
-
-	if _, err := os.Stat(keyFile); err != nil {
-		return nil, fmt.Errorf("TLS key file: %w", err)
-	}
-
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("TLS file pair: %w", err)
-	}
-
-	config := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}
-
-	if caFile != "" {
-		if _, err = os.Stat(caFile); err != nil {
-			return nil, fmt.Errorf("TLS CA file: %w", err)
-		}
-
-		var b []byte
-
-		if b, err = os.ReadFile(caFile); err != nil {
-			return nil, err
-		}
-
-		ca := x509.NewCertPool()
-		if ok := ca.AppendCertsFromPEM(b); !ok {
-			return nil, fmt.Errorf("TLS CA file: failed to parse")
-		}
-
-		config.ClientAuth = tls.RequireAndVerifyClientCert
-		config.ClientCAs = ca
-	}
-
-	return config, nil
 }
 
 // Listen creates a new listener and starts listening on configured interfaces.
@@ -155,17 +112,62 @@ func Listen(opts *ListenerOpts) (l *Listener, err error) {
 	}
 
 	if l.TLS != "" {
-		var config *tls.Config
+		// The client authentication mode is fixed for the lifetime of the listener.
+		// It can not be changed by later bundle reloads.
+		l.tlsClientAuth = tls.NoClientCert
+		if l.TLSCAFile != "" {
+			l.tlsClientAuth = tls.RequireAndVerifyClientCert
+		}
 
-		if config, err = tlsConfig(l.TLSCertFile, l.TLSKeyFile, l.TLSCAFile); err != nil {
+		bundlePaths := []string{l.TLSCertFile, l.TLSKeyFile}
+		if l.TLSCAFile != "" {
+			bundlePaths = append(bundlePaths, l.TLSCAFile)
+		}
+
+		// The initial bundle goes through the same read-and-validate path as later reloads.
+		var contents [][]byte
+
+		contents, err = readStableFiles(os.ReadFile, bundlePaths)
+		if err != nil {
 			err = lazyerrors.Error(err)
 			return
 		}
 
-		if l.tlsListener, err = tls.Listen("tcp", l.TLS, config); err != nil {
+		var caPEM []byte
+
+		if l.TLSCAFile != "" {
+			caPEM = contents[2]
+		}
+
+		var bundle *tlsBundle
+
+		bundle, err = newTLSBundle(1, "", contents[0], contents[1], caPEM, l.tlsClientAuth)
+		if err != nil {
 			err = lazyerrors.Error(err)
 			return
 		}
+
+		l.tlsBundle = bundle
+		l.lm.tlsBundleGeneration.Set(1)
+
+		// The wrapper only selects the current generation for every handshake.
+		// The returned config is immutable and used for the whole handshake,
+		// so a connection can never observe a mixed bundle of different generations.
+		wrapper := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			GetConfigForClient: func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
+				return l.currentTLSConfig()
+			},
+		}
+
+		var tcpListener net.Listener
+
+		if tcpListener, err = net.Listen("tcp", l.TLS); err != nil {
+			err = lazyerrors.Error(err)
+			return
+		}
+
+		l.tlsListener = tls.NewListener(tcpListener, wrapper)
 
 		ll.InfoContext(ctx, fmt.Sprintf("Listening on TLS %s", l.TLSAddr()))
 	}
@@ -174,20 +176,29 @@ func Listen(opts *ListenerOpts) (l *Listener, err error) {
 }
 
 // close closes all listeners.
+//
+// Taking the bundle lock makes it synchronize with concurrent [Listener.ReloadTLSBundle]
+// calls: a reload either commits before the listeners are closed or fails with
+// [ErrListenerClosed], and no bundle is ever published on a closed listener.
 func (l *Listener) close() {
-	if l.tcpListener != nil {
-		_ = l.tcpListener.Close()
-	}
+	l.closeOnce.Do(func() {
+		l.tlsMu.Lock()
+		defer l.tlsMu.Unlock()
 
-	if l.unixListener != nil {
-		_ = l.unixListener.Close()
-	}
+		if l.tcpListener != nil {
+			_ = l.tcpListener.Close()
+		}
 
-	if l.tlsListener != nil {
-		_ = l.tlsListener.Close()
-	}
+		if l.unixListener != nil {
+			_ = l.unixListener.Close()
+		}
 
-	close(l.listenersClosed)
+		if l.tlsListener != nil {
+			_ = l.tlsListener.Close()
+		}
+
+		close(l.listenersClosed)
+	})
 }
 
 // Listening returns true if the listener is currently listening and accepting new connection.

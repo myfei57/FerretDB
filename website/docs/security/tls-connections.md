@@ -97,3 +97,50 @@ docker run --rm -it \
   --entrypoint=mongosh \
   mongo 'mongodb://username:password@host.docker.internal:27018/?tls=true&tlsCertificateKeyFile=/clients/client.pem&tlsCaFile=/clients/rootCA-cert.pem'
 ```
+
+## Rotating TLS certificates and CA bundles
+
+A running TLS listener can switch its server certificate, private key and, when mTLS is
+enabled, its client CA bundle without closing or re-binding the listening TCP port.
+The Go API entry point is the `ReloadTLSBundle` method of the listener
+(`internal/clientconn` package), which can be used by embedders and administrative
+integrations after replacing the PEM files on disk.
+
+A reload is fully atomic:
+
+- every candidate file is read twice and completely validated before anything is
+  published, so a file that changes while it is read, a corrupt PEM block, or a
+  certificate/key pair that does not match makes the reload fail and leaves the
+  currently running configuration untouched;
+- each successful reload publishes one immutable TLS configuration generation, and every
+  new handshake pins a complete generation through the standard
+  `tls.Config.GetConfigForClient` mechanism, so a handshake can never use a new server
+  certificate together with an old client CA pool;
+- concurrent reloads are serialized and committed with strictly increasing, contiguous
+  generation numbers, and reloads after the listener is closed are rejected;
+- the caller may pass an opaque bundle identifier and/or the expected SHA-256 digest of
+  the complete bundle to make sure the files that were read belong to the intended
+  deployment and were not mixed across deployments.
+
+The client authentication mode is fixed when the listener starts.
+
+- When the `--listen-tls-ca-file` flag is set, the listener requires and verifies client
+  certificates; a reload can replace the trusted client CAs but can never downgrade that
+  requirement, and an empty or unreadable CA file is rejected instead of weakening it.
+- When the flag is not set, client certificate verification stays disabled; an empty or
+  stray CA file can never enable mTLS by itself.
+
+Reloading a bundle only affects new handshakes on the inbound TLS listener.
+
+- Connections that were already established keep using the bundle they handshaked with
+  until they disconnect, exactly as TLS guarantees.
+  Rotating the client CA therefore does not retroactively revoke or close existing
+  connections; clients that must be disconnected need to be closed separately.
+- The proxy connection and the backend database connection keep their own TLS
+  configuration and are never affected by an inbound bundle reload.
+
+Private key contents are never written to logs or metrics.
+Reloads are counted by the `ferretdb_client_tls_bundle_reloads_total` metric (with `result`
+and fixed `reason` labels), and `ferretdb_client_tls_bundle_generation` exposes the
+generation currently used by new handshakes; log messages only contain the generation
+number, the caller-provided identifier and the bundle digest.
