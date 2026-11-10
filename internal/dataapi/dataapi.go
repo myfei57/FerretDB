@@ -62,6 +62,11 @@ func Listen(opts *ListenOpts) (*Listener, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /openapi.json", s.OpenAPISpec)
 
+	// Streaming endpoints are registered directly instead of being generated
+	// from the OpenAPI description, but they still go through ConnInfo and
+	// (when enabled) authentication middlewares below.
+	mux.HandleFunc("POST /action/findStream", s.FindStream)
+
 	h := api.HandlerFromMux(s, mux)
 	if opts.Auth {
 		h = s.AuthMiddleware(h)
